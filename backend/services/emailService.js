@@ -148,6 +148,8 @@ class EmailService {
       }
 
       const recipients = [];
+      const sheetHeaders = rows[0]; // Store headers for personalization
+
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
         if (row[emailIndex] && row[emailIndex].trim()) {
@@ -155,12 +157,14 @@ class EmailService {
             email: row[emailIndex].trim(),
             name: nameIndex !== -1 ? (row[nameIndex] || "").trim() : "",
             rowData: row,
+            headers: sheetHeaders, // Include headers for dynamic personalization
           });
         }
       }
 
       console.log(
-        `Successfully parsed ${recipients.length} recipients from sheet`
+        `Successfully parsed ${recipients.length} recipients from sheet with headers:`,
+        sheetHeaders
       );
       return recipients;
     } catch (error) {
@@ -239,7 +243,15 @@ class EmailService {
   // Send individual email
   async sendEmail(transporter, emailData, campaignId, oauth2Client = null) {
     try {
-      const { to, subject, body, senderEmail, recipientName } = emailData;
+      const {
+        to,
+        subject,
+        body,
+        senderEmail,
+        recipientName,
+        recipientData,
+        sheetHeaders,
+      } = emailData;
 
       console.log(`📧 Preparing email for ${to}...`);
 
@@ -247,7 +259,7 @@ class EmailService {
       let personalizedBody = body;
       let personalizedSubject = subject;
 
-      // Replace placeholders
+      // Basic replacements
       const replacements = {
         "{{name}}": recipientName || "there",
         "{{email}}": to,
@@ -255,13 +267,37 @@ class EmailService {
         "{{Email}}": to,
       };
 
+      // Add dynamic replacements from Google Sheet columns
+      if (recipientData && sheetHeaders) {
+        recipientData.forEach((value, index) => {
+          if (sheetHeaders[index]) {
+            const headerName = sheetHeaders[index].toLowerCase().trim();
+            const displayName = sheetHeaders[index].trim();
+
+            // Add various formats of the column name as placeholders
+            replacements[`{{${headerName}}}`] = value || "";
+            replacements[`{{${displayName}}}`] = value || "";
+
+            // Handle common variations
+            if (headerName.includes("name")) {
+              replacements[`{{name}}`] = value || recipientName || "there";
+              replacements[`{{Name}}`] = value || recipientName || "there";
+            }
+            if (headerName.includes("email")) {
+              replacements[`{{email}}`] = value || to;
+              replacements[`{{Email}}`] = value || to;
+            }
+          }
+        });
+      }
+
       Object.entries(replacements).forEach(([placeholder, value]) => {
         personalizedBody = personalizedBody.replace(
-          new RegExp(placeholder, "g"),
+          new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
           value
         );
         personalizedSubject = personalizedSubject.replace(
-          new RegExp(placeholder, "g"),
+          new RegExp(placeholder.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g"),
           value
         );
       });
@@ -293,12 +329,22 @@ class EmailService {
 
           // Fallback to nodemailer
           try {
+            // Optimize HTML for email clients
+            const isHtmlContent =
+              personalizedBody.includes("<") && personalizedBody.includes(">");
+            const optimizedHtml = isHtmlContent
+              ? this.optimizeHtmlForEmail(personalizedBody)
+              : personalizedBody;
+
             const mailOptions = {
               from: senderEmail,
               to: to,
               subject: personalizedSubject,
-              html: personalizedBody,
-              text: personalizedBody.replace(/<[^>]*>/g, ""), // Strip HTML for text version
+              html: optimizedHtml,
+              text: optimizedHtml
+                .replace(/<[^>]*>/g, "")
+                .replace(/\s+/g, " ")
+                .trim(), // Strip HTML for text version
             };
 
             const result = await transporter.sendMail(mailOptions);
@@ -326,12 +372,22 @@ class EmailService {
         }
       } else {
         // No oauth2Client provided, use nodemailer only
+        // Optimize HTML for email clients
+        const isHtmlContent =
+          personalizedBody.includes("<") && personalizedBody.includes(">");
+        const optimizedHtml = isHtmlContent
+          ? this.optimizeHtmlForEmail(personalizedBody)
+          : personalizedBody;
+
         const mailOptions = {
           from: senderEmail,
           to: to,
           subject: personalizedSubject,
-          html: personalizedBody,
-          text: personalizedBody.replace(/<[^>]*>/g, ""), // Strip HTML for text version
+          html: optimizedHtml,
+          text: optimizedHtml
+            .replace(/<[^>]*>/g, "")
+            .replace(/\s+/g, " ")
+            .trim(), // Strip HTML for text version
         };
 
         const result = await transporter.sendMail(mailOptions);
@@ -366,6 +422,112 @@ class EmailService {
   }
 
   // Backup method: Send email using Gmail API directly
+  // Optimize HTML content for email clients
+  optimizeHtmlForEmail(htmlContent) {
+    if (!htmlContent || !htmlContent.includes("<")) {
+      return htmlContent;
+    }
+
+    let optimizedHtml = htmlContent;
+
+    // 1. Ensure all links have proper attributes for email clients
+    optimizedHtml = optimizedHtml.replace(
+      /<a\s+([^>]*?)href=["']([^"']+)["']([^>]*?)>/gi,
+      (match, beforeHref, url, afterHref) => {
+        // Ensure target="_blank" and add tracking attributes
+        const hasTarget = /target\s*=/i.test(beforeHref + afterHref);
+        const hasRel = /rel\s*=/i.test(beforeHref + afterHref);
+
+        let linkAttributes = `${beforeHref}href="${url}"${afterHref}`;
+
+        if (!hasTarget) {
+          linkAttributes += ' target="_blank"';
+        }
+        if (!hasRel) {
+          linkAttributes += ' rel="noopener"';
+        }
+
+        // Add email-safe styling if not present
+        if (!linkAttributes.includes("style=")) {
+          linkAttributes +=
+            ' style="color: #3b82f6; text-decoration: underline;"';
+        }
+
+        return `<a ${linkAttributes}>`;
+      }
+    );
+
+    // 2. Optimize images for email clients
+    optimizedHtml = optimizedHtml.replace(
+      /<img\s+([^>]*?)src=["']([^"']+)["']([^>]*?)>/gi,
+      (match, beforeSrc, imageUrl, afterSrc) => {
+        let imgAttributes = `${beforeSrc}src="${imageUrl}"${afterSrc}`;
+
+        // Ensure alt text exists
+        if (!imgAttributes.includes("alt=")) {
+          imgAttributes += ' alt="Image"';
+        }
+
+        // Add email-safe image styling
+        const hasStyle = /style\s*=/i.test(imgAttributes);
+        if (!hasStyle) {
+          imgAttributes +=
+            ' style="display: block; max-width: 100%; height: auto; border: 0;"';
+        } else {
+          // Enhance existing styles with email-safe properties
+          imgAttributes = imgAttributes.replace(
+            /style=["']([^"']*?)["']/gi,
+            (styleMatch, existingStyle) => {
+              const enhancedStyle =
+                existingStyle +
+                (existingStyle.includes("display") ? "" : "; display: block") +
+                (existingStyle.includes("border") ? "" : "; border: 0") +
+                (existingStyle.includes("max-width")
+                  ? ""
+                  : "; max-width: 100%");
+              return `style="${enhancedStyle}"`;
+            }
+          );
+        }
+
+        return `<img ${imgAttributes}>`;
+      }
+    );
+
+    // 3. Wrap content in email-safe container
+    const emailWrapper = `
+      <div style="font-family: Arial, 'Helvetica Neue', Helvetica, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; background-color: #ffffff;">
+        ${optimizedHtml}
+      </div>
+    `;
+
+    // 4. Add email-safe DOCTYPE and meta tags
+    const fullHtmlEmail = `
+      <!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+      <html xmlns="http://www.w3.org/1999/xhtml">
+      <head>
+        <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>Email</title>
+        <!--[if mso]>
+        <noscript>
+          <xml>
+            <o:OfficeDocumentSettings>
+              <o:PixelsPerInch>96</o:PixelsPerInch>
+            </o:OfficeDocumentSettings>
+          </xml>
+        </noscript>
+        <![endif]-->
+      </head>
+      <body style="margin: 0; padding: 0; background-color: #f4f4f4;">
+        ${emailWrapper}
+      </body>
+      </html>
+    `.trim();
+
+    return fullHtmlEmail;
+  }
+
   async sendEmailViaGmailAPI(
     oauth2Client,
     emailData,
@@ -391,17 +553,59 @@ class EmailService {
 
       const gmail = google.gmail({ version: "v1", auth: oauth2Client });
 
-      // Create the email message with proper MIME format
-      const email = [
-        `From: ${senderEmail}`,
-        `To: ${to}`,
-        `Subject: ${subject}`,
-        `MIME-Version: 1.0`,
-        `Content-Type: text/html; charset=utf-8`,
-        `Content-Transfer-Encoding: quoted-printable`,
-        "",
-        body,
-      ].join("\r\n");
+      // Check if body contains HTML
+      const isHtmlContent = body.includes("<") && body.includes(">");
+
+      // Optimize HTML content for email clients
+      const optimizedBody = isHtmlContent
+        ? this.optimizeHtmlForEmail(body)
+        : body;
+
+      let email;
+
+      if (isHtmlContent) {
+        // Create multipart MIME message for HTML emails
+        const textVersion = optimizedBody
+          .replace(/<[^>]*>/g, "")
+          .replace(/\s+/g, " ")
+          .trim(); // Strip HTML for text version
+        const boundary =
+          "----=_Part_" + Math.random().toString(36).substr(2, 9);
+
+        email = [
+          `From: ${senderEmail}`,
+          `To: ${to}`,
+          `Subject: ${subject}`,
+          `MIME-Version: 1.0`,
+          `Content-Type: multipart/alternative; boundary="${boundary}"`,
+          ``,
+          `--${boundary}`,
+          `Content-Type: text/plain; charset=utf-8`,
+          `Content-Transfer-Encoding: 7bit`,
+          ``,
+          textVersion,
+          ``,
+          `--${boundary}`,
+          `Content-Type: text/html; charset=utf-8`,
+          `Content-Transfer-Encoding: 7bit`,
+          ``,
+          optimizedBody,
+          ``,
+          `--${boundary}--`,
+        ].join("\r\n");
+      } else {
+        // Simple plain text message
+        email = [
+          `From: ${senderEmail}`,
+          `To: ${to}`,
+          `Subject: ${subject}`,
+          `MIME-Version: 1.0`,
+          `Content-Type: text/plain; charset=utf-8`,
+          `Content-Transfer-Encoding: 7bit`,
+          "",
+          body,
+        ].join("\r\n");
+      }
 
       // Encode the email
       const encodedEmail = Buffer.from(email)
@@ -410,7 +614,11 @@ class EmailService {
         .replace(/\//g, "_")
         .replace(/=+$/, "");
 
-      console.log(`📤 Sending via Gmail API...`);
+      console.log(
+        `📤 Sending via Gmail API (${
+          isHtmlContent ? "HTML" : "TEXT"
+        } format)...`
+      );
 
       // Send via Gmail API
       const result = await gmail.users.messages.send({
@@ -873,7 +1081,8 @@ class EmailService {
           body: campaign.body,
           senderEmail: campaign.sender_email,
           recipientName: recipient.name,
-          rowData: recipient.rowData, // Include all row data for personalization
+          recipientData: recipient.rowData, // Include all row data for personalization
+          sheetHeaders: recipient.headers, // Include headers for dynamic placeholders
         };
 
         // Send email with retry logic
